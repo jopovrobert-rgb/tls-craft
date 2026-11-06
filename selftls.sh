@@ -5,7 +5,7 @@
 #
 # Debian and Ubuntu, systemd, root. See README.md.
 
-VERSION=1.2.2
+VERSION=1.2.4
 
 set -euo pipefail
 
@@ -126,7 +126,17 @@ valid_domain() {
 }
 
 valid_email() {
-  [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
+  local domain
+  [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || return 1
+  domain=${1##*@}
+  domain=${domain,,}
+  # Let's Encrypt rejects reserved names such as example.com.
+  case "$domain" in
+    example.com|example.org|example.net|example.edu|localhost|*.example.com|*.example.org|*.example.net|*.localhost)
+      return 1
+      ;;
+  esac
+  return 0
 }
 
 valid_name() {
@@ -1101,11 +1111,14 @@ issue_cert() {
     rm -f "$installer"
   fi
   [[ -x "$acme" ]] || die "acme.sh не установился"
+  # A failed registration leaves the old contact in account.conf, and a later
+  # --accountemail does not replace it. Let's Encrypt then keeps rejecting example.com.
+  force_acme_email
   "$acme" --set-default-ca --server letsencrypt
   local rc=0
   "$acme" --issue -d "$DOMAIN" -w "$web" --keylength ec-256 --accountemail "$EMAIL" --server letsencrypt || rc=$?
   if [[ "$rc" -ne 0 && "$rc" -ne 2 ]]; then
-    die "Let's Encrypt не выдал сертификат для $DOMAIN (код $rc). Порт 80 должен открываться снаружи на этот nginx."
+    die "Let's Encrypt не выдал сертификат для $DOMAIN (код $rc). Почта $EMAIL должна быть настоящей, и порт 80 этого сервера должен открываться снаружи."
   fi
   local group
   group=$(cert_group)
@@ -1119,6 +1132,16 @@ issue_cert() {
     --reloadcmd "$reload"
   fix_cert_perms
   [[ -s "$(cert_file)" && -s "$(key_file)" ]] || die "файлы сертификата пустые"
+}
+
+force_acme_email() {
+  local conf=/root/.acme.sh/account.conf tmp
+  [[ -f "$conf" ]] || return 0
+  tmp=$(mktemp)
+  grep -v '^ACCOUNT_EMAIL=' "$conf" >"$tmp" || true
+  printf "ACCOUNT_EMAIL='%s'\n" "$EMAIL" >>"$tmp"
+  cat "$tmp" >"$conf"
+  rm -f "$tmp"
 }
 
 cert_group() {
