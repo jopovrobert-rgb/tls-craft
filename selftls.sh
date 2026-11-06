@@ -5,7 +5,7 @@
 #
 # Debian and Ubuntu, systemd, root. See README.md.
 
-VERSION=1.2.1
+VERSION=1.2.2
 
 set -euo pipefail
 
@@ -41,6 +41,7 @@ PURGE=0
 USE_H2=1
 MODE=
 PUBLIC_PORT=
+PUBLIC_IP=
 PROMPTED=0
 DISABLED_DEFAULT=0
 HTTP_PORT=
@@ -87,8 +88,9 @@ VLESS TCP + TLS (xtls-rprx-vision) на 443 и обычный сайт для в
   sudo ./selftls.sh uninstall
   sudo ./selftls.sh uninstall --purge
 
-Флаги install: --domain --email --template --name --force
---force пропускает сверку DNS, если запись A ещё не сошлась с адресом сервера.
+Флаги install: --domain --email --template --name --ip --force
+--ip ставит дополнительный адрес этой ВМ, если A-запись смотрит не на основной.
+--force пропускает сверку DNS.
 Нужны Debian или Ubuntu, свободные 80 и 443, и A-запись домена на этот VPS.
 EOF
 }
@@ -146,6 +148,15 @@ valid_port() {
 valid_public_port() {
   [[ "$1" =~ ^[0-9]{2,5}$ ]] || return 1
   ((10#$1 >= 443 && 10#$1 <= 65535))
+}
+
+valid_ipv4() {
+  local octet
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS=. read -r o1 o2 o3 o4 <<<"$1"
+  for octet in "$o1" "$o2" "$o3" "$o4"; do
+    ((10#$octet <= 255)) || return 1
+  done
 }
 
 valid_uuid() {
@@ -424,6 +435,11 @@ load_state() {
         valid_public_port "$val" || die "битый PUBLIC_PORT в $file"
         [[ -z "$PUBLIC_PORT" ]] && PUBLIC_PORT=$val
         ;;
+      PUBLIC_IP)
+        [[ -z "$val" ]] && continue
+        valid_ipv4 "$val" || die "битый PUBLIC_IP в $file"
+        [[ -z "$PUBLIC_IP" ]] && PUBLIC_IP=$val
+        ;;
       *)
         die "неизвестное поле $key в $file"
         ;;
@@ -468,6 +484,7 @@ H2_PORT=${H2_PORT}
 DISABLED_DEFAULT=${DISABLED_DEFAULT}
 MODE=${MODE}
 PUBLIC_PORT=${PUBLIC_PORT}
+PUBLIC_IP=${PUBLIC_IP}
 EOF
   chmod 600 "$file"
 }
@@ -968,7 +985,7 @@ public_ipv4() {
     ip=$(curl -4fsS --max-time 6 "$url" 2>/dev/null || true)
     ip=${ip//$'\r'/}
     ip=${ip//$'\n'/}
-    if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    if valid_ipv4 "$ip"; then
       printf '%s\n' "$ip"
       return 0
     fi
@@ -976,30 +993,48 @@ public_ipv4() {
   return 1
 }
 
+local_ipv4s() {
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+    return 0
+  fi
+  hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+(\.[0-9]+){3}$' || true
+}
+
 dns_v4() {
   getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u
 }
 
 check_dns() {
-  local ip candidate matched=0
-  local -a records=()
+  local ip candidate egress matched=0
+  local -a records=() ours=()
   [[ "$FORCE" -eq 1 ]] && return 0
+  if [[ -n "$PUBLIC_IP" ]]; then
+    valid_ipv4 "$PUBLIC_IP" || die "--ip не похож на IPv4: $PUBLIC_IP"
+  fi
   mapfile -t records < <(dns_v4 || true)
   if [[ ${#records[@]} -eq 0 ]]; then
     die "у $DOMAIN нет A-записи. Поставьте её на адрес сервера или повторите с --force"
   fi
-  if ! ip=$(public_ipv4); then
-    say "Внешний IPv4 не узнался. A-запись $DOMAIN: ${records[*]}. Сверку пропускаю."
+  mapfile -t ours < <(local_ipv4s || true)
+  [[ -n "$PUBLIC_IP" ]] && ours+=("$PUBLIC_IP")
+  if egress=$(public_ipv4); then
+    ours+=("$egress")
+  fi
+  if [[ ${#ours[@]} -eq 0 ]]; then
+    say "Адреса сервера не узнались. A-запись $DOMAIN: ${records[*]}. Сверку пропускаю."
     return 0
   fi
   for candidate in "${records[@]}"; do
-    if [[ "$candidate" == "$ip" ]]; then
-      matched=1
-      break
-    fi
+    for ip in "${ours[@]}"; do
+      if [[ "$candidate" == "$ip" ]]; then
+        matched=1
+        break 2
+      fi
+    done
   done
   if [[ "$matched" -ne 1 ]]; then
-    die "A-запись $DOMAIN указывает на ${records[*]}, а внешний адрес сервера $ip. Поправьте DNS или повторите с --force"
+    die "A-запись $DOMAIN указывает на ${records[*]}, а адреса этого сервера: ${ours[*]}. Дополнительный адрес, которого не видно внутри ВМ, передай как --ip АДРЕС или повтори с --force"
   fi
   if getent ahostsv6 "$DOMAIN" >/dev/null 2>&1; then
     say "У $DOMAIN есть AAAA. Xray слушает только IPv4. Уберите AAAA, иначе часть клиентов уйдёт мимо."
@@ -1772,6 +1807,11 @@ parse_args() {
       --port)
         [[ $# -ge 2 ]] || die "--port нуждается в значении"
         PUBLIC_PORT=$2
+        shift 2
+        ;;
+      --ip)
+        [[ $# -ge 2 ]] || die "--ip нуждается в значении"
+        PUBLIC_IP=$2
         shift 2
         ;;
       --) shift; break ;;
