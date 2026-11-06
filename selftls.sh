@@ -5,7 +5,7 @@
 #
 # Debian and Ubuntu, systemd, root. See README.md.
 
-VERSION=1.2.0
+VERSION=1.2.1
 
 set -euo pipefail
 
@@ -807,25 +807,36 @@ write_remnawave_inbound() {
     --argjson alpn "$alpn" \
     --arg cert "$(cert_file)" \
     --arg key "$(key_file)" \
+    --arg serverName "$DOMAIN" \
     '{
-      listen: "0.0.0.0",
-      port: $port,
-      protocol: "vless",
-      tag: "vless-tcp-tls",
-      settings: {
-        clients: [],
-        decryption: "none",
-        fallbacks: $fallbacks
-      },
-      streamSettings: {
-        method: "raw",
-        security: "tls",
-        tlsSettings: {
-          alpn: $alpn,
-          certificates: [{certificateFile: $cert, keyFile: $key}]
-        }
-      },
-      sniffing: {enabled: true, destOverride: ["http", "tls", "quic"]}
+      log: {loglevel: "warning"},
+      inbounds: [{
+        listen: "0.0.0.0",
+        port: $port,
+        protocol: "vless",
+        tag: "vless-tcp-tls",
+        settings: {
+          clients: [],
+          decryption: "none",
+          flow: "xtls-rprx-vision",
+          fallbacks: $fallbacks
+        },
+        streamSettings: {
+          network: "tcp",
+          security: "tls",
+          tlsSettings: {
+            serverName: $serverName,
+            alpn: $alpn,
+            certificates: [{certificateFile: $cert, keyFile: $key}]
+          }
+        },
+        sniffing: {enabled: true, destOverride: ["http", "tls", "quic"]}
+      }],
+      outbounds: [
+        {tag: "DIRECT", protocol: "freedom"},
+        {tag: "BLOCK", protocol: "blackhole"}
+      ],
+      routing: {rules: []}
     }' >"$tmp"
   mv "$tmp" "$dest"
   chmod 644 "$dest"
@@ -1347,9 +1358,10 @@ cmd_install() {
     say
     cat "$(inbound_file)"
     say
-    say "Клиентов впиши в панели. В этом json список пустой специально."
-    say "Если панель не принимает \"method\": \"raw\", замени его на \"network\": \"tcp\"."
-    say "Если нода в Docker и не видит эти пути, примонтируй $(cert_dir) в контейнер по тому же пути и перезапусти её."
+    say "Клиентов панель дописывает сама. SNI берётся из serverName ($DOMAIN), flow уже xtls-rprx-vision."
+    say "В хосте поле SNI оставь пустым и выключи keep SNI blank. Иначе ссылка опять выйдет с пустым sni."
+    say "Нода файлы с диска не читает: сертификат забирает панель и сама отправляет его на ноду."
+    say "Монтировать надо контейнер панели, не ноды. В инбаунде укажи путь внутри контейнера панели."
     return 0
   fi
   test_xray_config
