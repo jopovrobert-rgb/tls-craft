@@ -5,7 +5,7 @@
 #
 # Debian and Ubuntu, systemd, root. See README.md.
 
-VERSION=1.3.2
+VERSION=1.3.3
 
 set -euo pipefail
 
@@ -42,6 +42,8 @@ USE_H2=1
 MODE=
 PUBLIC_PORT=
 PUBLIC_IP=
+PORT_FROM_FLAG=0
+STANDALONE=0
 PROMPTED=0
 DISABLED_DEFAULT=0
 HTTP_PORT=
@@ -1491,11 +1493,16 @@ prompt_missing() {
     fi
   fi
   valid_template "$TEMPLATE" || die "шаблон: ledger, press или kiln"
-  if [[ "$MODE" == remnawave && -z "$PUBLIC_PORT" ]]; then
+  if [[ "$MODE" == remnawave && "$PORT_FROM_FLAG" -eq 0 ]]; then
     if [[ -t 0 ]]; then
       PROMPTED=1
-      read -r -p "Порт ноды Remnawave: " PUBLIC_PORT
-    else
+      if [[ -n "$PUBLIC_PORT" ]]; then
+        read -r -p "Порт ноды Remnawave [$PUBLIC_PORT]: " answer
+        [[ -n "$answer" ]] && PUBLIC_PORT=$answer
+      else
+        read -r -p "Порт ноды Remnawave: " PUBLIC_PORT
+      fi
+    elif [[ -z "$PUBLIC_PORT" ]]; then
       die "укажите --port, на котором уже слушает нода"
     fi
   fi
@@ -1566,7 +1573,7 @@ cmd_install() {
   if [[ -f "$(state_file)" ]]; then
     load_state
   fi
-  if [[ -z "$MODE" ]]; then
+  if [[ "$STANDALONE" -eq 0 ]]; then
     MODE=remnawave
   fi
   prompt_missing
@@ -1602,7 +1609,7 @@ cmd_install() {
     reload_node
     mount_cert_in_compose
     cat "$(inbound_file)"
-    return 0
+    exit 0
   fi
   test_xray_config
   systemctl enable xray
@@ -2009,10 +2016,11 @@ parse_args() {
       --purge) PURGE=1; shift ;;
       --no-h2) USE_H2=0; shift ;;
       --remnawave) MODE=remnawave; shift ;;
-      --standalone) MODE=standalone; shift ;;
+      --standalone) STANDALONE=1; MODE=standalone; shift ;;
       --port)
         [[ $# -ge 2 ]] || die "--port нуждается в значении"
         PUBLIC_PORT=$2
+        PORT_FROM_FLAG=1
         shift 2
         ;;
       --ip)
