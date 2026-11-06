@@ -5,7 +5,7 @@
 #
 # Debian and Ubuntu, systemd, root. See README.md.
 
-VERSION=1.1.0
+VERSION=1.2.0
 
 set -euo pipefail
 
@@ -39,6 +39,8 @@ HTTP2_STYLE=
 FORCE=0
 PURGE=0
 USE_H2=1
+MODE=
+PUBLIC_PORT=
 PROMPTED=0
 DISABLED_DEFAULT=0
 HTTP_PORT=
@@ -58,6 +60,13 @@ VLESS TCP + TLS (xtls-rprx-vision) на 443 и обычный сайт для в
 
   curl -fsSL https://raw.githubusercontent.com/USER/tls-craft/main/selftls.sh -o selftls.sh
   sudo bash selftls.sh install --domain example.com --email you@example.com
+
+Рядом с нодой Remnawave, не занимая её порт и не трогая вход с мостом:
+
+  sudo bash selftls.sh @ install --remnawave --port 4443 --domain exit.example.com --email you@example.com
+
+Скрипт выпускает сертификат и поднимает сайт на localhost. Инбаунд для панели лежит в
+/usr/local/etc/selftls/remnawave-inbound.json. Xray Remnawave скрипт не перезаписывает.
 
 Знак @ перед командой игнорируется, как в selfsteal:
 
@@ -132,6 +141,11 @@ valid_template() {
 valid_port() {
   [[ "$1" =~ ^[0-9]{2,5}$ ]] || return 1
   ((10#$1 >= 1024 && 10#$1 <= 65535))
+}
+
+valid_public_port() {
+  [[ "$1" =~ ^[0-9]{2,5}$ ]] || return 1
+  ((10#$1 >= 443 && 10#$1 <= 65535))
 }
 
 valid_uuid() {
@@ -366,6 +380,7 @@ xray_error_log() { root_path /var/log/xray/error.log; }
 nginx_access_log() { root_path /var/log/nginx/selftls.access.log; }
 links_file() { root_path /usr/local/etc/selftls/links.txt; }
 clients_dir() { root_path /usr/local/etc/selftls/clients; }
+inbound_file() { root_path /usr/local/etc/selftls/remnawave-inbound.json; }
 
 load_state() {
   local file line key val
@@ -401,16 +416,45 @@ load_state() {
         [[ "$val" == 0 || "$val" == 1 ]] || die "битый DISABLED_DEFAULT в $file"
         DISABLED_DEFAULT=$val
         ;;
+      MODE)
+        [[ "$val" == standalone || "$val" == remnawave ]] || die "битый MODE в $file"
+        [[ -z "$MODE" ]] && MODE=$val
+        ;;
+      PUBLIC_PORT)
+        valid_public_port "$val" || die "битый PUBLIC_PORT в $file"
+        [[ -z "$PUBLIC_PORT" ]] && PUBLIC_PORT=$val
+        ;;
       *)
         die "неизвестное поле $key в $file"
         ;;
     esac
   done <"$file"
   [[ -n "$DOMAIN" && -n "$EMAIL" && -n "$TEMPLATE" && -n "$HTTP_PORT" && -n "$H2_PORT" ]] || die "в $file не хватает полей"
+  normalize_mode
+}
+
+normalize_mode() {
+  MODE=${MODE:-standalone}
+  PUBLIC_PORT=${PUBLIC_PORT:-443}
+  case "$MODE" in
+    standalone|remnawave) ;;
+    *) die "режим: standalone или remnawave" ;;
+  esac
+  if [[ "$PUBLIC_PORT" == 80 ]]; then
+    die "порт 80 занят выпуском сертификата"
+  fi
+  valid_public_port "$PUBLIC_PORT" || die "порт ноды кривой: $PUBLIC_PORT"
+  if [[ -n "$HTTP_PORT" && "$PUBLIC_PORT" == "$HTTP_PORT" ]]; then
+    die "порт ноды $PUBLIC_PORT совпал с локальным сайтом"
+  fi
+  if [[ -n "$H2_PORT" && "$PUBLIC_PORT" == "$H2_PORT" ]]; then
+    die "порт ноды $PUBLIC_PORT совпал с локальным h2"
+  fi
 }
 
 save_state() {
   local file dir
+  normalize_mode
   file=$(state_file)
   dir=$(dirname "$file")
   mkdir -p "$dir"
@@ -422,6 +466,8 @@ TEMPLATE=${TEMPLATE}
 HTTP_PORT=${HTTP_PORT}
 H2_PORT=${H2_PORT}
 DISABLED_DEFAULT=${DISABLED_DEFAULT}
+MODE=${MODE}
+PUBLIC_PORT=${PUBLIC_PORT}
 EOF
   chmod 600 "$file"
 }
@@ -598,7 +644,7 @@ EOF
 }
 
 write_nginx() {
-  local file root_dir acme access h2_listen
+  local file root_dir acme access h2_listen https_redir
   file=$(nginx_site)
   root_dir=$(site_dir)
   acme=$(acme_dir)
@@ -606,6 +652,14 @@ write_nginx() {
   mkdir -p "$(dirname "$file")" "$(dirname "$access")" "$acme"
   choose_http2_style
   detect_h2
+  normalize_mode
+  if [[ "$PUBLIC_PORT" == 443 ]]; then
+    # shellcheck disable=SC2016
+    https_redir="return 301 https://${DOMAIN}"'$request_uri;'
+  else
+    # shellcheck disable=SC2016
+    https_redir="return 301 https://${DOMAIN}:${PUBLIC_PORT}"'$request_uri;'
+  fi
 
   {
     cat <<EOF
@@ -627,7 +681,7 @@ EOF
     }
 
     location / {
-        return 301 https://${DOMAIN}\$request_uri;
+        ${https_redir}
     }
 }
 
@@ -728,6 +782,53 @@ write_xray() {
     chown root:xray "$dest"
     chmod 640 "$dest"
   fi
+}
+
+write_remnawave_inbound() {
+  local dest tmp fallbacks alpn
+  normalize_mode
+  detect_h2
+  dest=$(inbound_file)
+  mkdir -p "$(dirname "$dest")"
+  if [[ "$USE_H2" -eq 1 ]]; then
+    alpn='["h2","http/1.1"]'
+    fallbacks=$(jq -n \
+      --arg http "127.0.0.1:${HTTP_PORT}" \
+      --arg h2 "127.0.0.1:${H2_PORT}" \
+      '[{dest: $http, xver: 1}, {alpn: "h2", dest: $h2, xver: 1}]')
+  else
+    alpn='["http/1.1"]'
+    fallbacks=$(jq -n --arg http "127.0.0.1:${HTTP_PORT}" '[{dest: $http, xver: 1}]')
+  fi
+  tmp=$(mktemp)
+  jq -n \
+    --argjson port "$PUBLIC_PORT" \
+    --argjson fallbacks "$fallbacks" \
+    --argjson alpn "$alpn" \
+    --arg cert "$(cert_file)" \
+    --arg key "$(key_file)" \
+    '{
+      listen: "0.0.0.0",
+      port: $port,
+      protocol: "vless",
+      tag: "vless-tcp-tls",
+      settings: {
+        clients: [],
+        decryption: "none",
+        fallbacks: $fallbacks
+      },
+      streamSettings: {
+        method: "raw",
+        security: "tls",
+        tlsSettings: {
+          alpn: $alpn,
+          certificates: [{certificateFile: $cert, keyFile: $key}]
+        }
+      },
+      sniffing: {enabled: true, destOverride: ["http", "tls", "quic"]}
+    }' >"$tmp"
+  mv "$tmp" "$dest"
+  chmod 644 "$dest"
 }
 
 new_uuid() {
@@ -899,11 +1000,21 @@ listeners() {
   ss -H -ltnp "sport = :$port" 2>/dev/null || true
 }
 
+refuse_if_stream_proxy() {
+  local conf=/etc/nginx/nginx.conf
+  [[ -f "$conf" ]] || return 0
+  if grep -q '^[[:space:]]*stream[[:space:]]*{' "$conf" && ! grep -q '^[[:space:]]*http[[:space:]]*{' "$conf"; then
+    die "На этом хосте nginx только проксирует TCP. Это вход или мост. Скрипт ставится на выход, рядом с нодой Remnawave."
+  fi
+}
+
 assert_ports_free() {
   local row
-  row=$(listeners 443)
-  if [[ -n "$row" ]] && ! grep -q 'xray' <<<"$row"; then
-    die "порт 443 занят не Xray: $row"
+  if [[ "$MODE" != remnawave ]]; then
+    row=$(listeners 443)
+    if [[ -n "$row" ]] && ! grep -q 'xray' <<<"$row"; then
+      die "порт 443 занят не Xray: $row"
+    fi
   fi
   row=$(listeners 80)
   if [[ -n "$row" ]] && ! grep -q 'nginx' <<<"$row"; then
@@ -950,26 +1061,62 @@ issue_cert() {
   if [[ "$rc" -ne 0 && "$rc" -ne 2 ]]; then
     die "Let's Encrypt не выдал сертификат для $DOMAIN (код $rc). Порт 80 должен открываться снаружи на этот nginx."
   fi
-  install -d -m 750 -o root -g xray "$(cert_dir)"
+  local group
+  group=$(cert_group)
+  install -d -m 750 -o root -g "$group" "$(cert_dir)"
   local reload
-  # acme.sh runs this as soon as the files are in place, which is before the
-  # VLESS config exists on a first install. A failed restart must not abort issuance.
-  reload="chown root:xray $(cert_file) $(key_file) && chmod 644 $(cert_file) && chmod 640 $(key_file) && systemctl restart xray || true"
+  # acme.sh runs this as soon as the files are in place. A failed restart must not abort issuance.
+  reload="chown root:${group} $(cert_file) $(key_file) && chmod 644 $(cert_file) && chmod 640 $(key_file) && true"
   "$acme" --install-cert -d "$DOMAIN" --ecc \
     --fullchain-file "$(cert_file)" \
     --key-file "$(key_file)" \
     --reloadcmd "$reload"
-  chown root:xray "$(cert_file)" "$(key_file)"
-  chmod 644 "$(cert_file)"
-  chmod 640 "$(key_file)"
+  fix_cert_perms
   [[ -s "$(cert_file)" && -s "$(key_file)" ]] || die "файлы сертификата пустые"
 }
 
+cert_group() {
+  if getent group xray >/dev/null 2>&1; then
+    printf '%s\n' xray
+  elif getent group remnanode >/dev/null 2>&1; then
+    printf '%s\n' remnanode
+  else
+    printf '%s\n' root
+  fi
+}
+
 fix_cert_perms() {
+  local group
   [[ -n "$PREFIX" ]] && return 0
-  chown root:xray "$(cert_file)" "$(key_file)"
+  [[ -s "$(cert_file)" && -s "$(key_file)" ]] || return 0
+  group=$(cert_group)
+  chown "root:${group}" "$(cert_file)" "$(key_file)"
   chmod 644 "$(cert_file)"
   chmod 640 "$(key_file)"
+}
+
+reload_node() {
+  if [[ "$MODE" == remnawave ]]; then
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files remnanode.service --no-legend 2>/dev/null | grep -q remnanode; then
+      systemctl restart remnanode || say "Не смог перезапустить remnanode. Сделай это в панели, когда сертификат уже на диске."
+      return 0
+    fi
+    if command -v docker >/dev/null 2>&1; then
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'remnanode'; then
+        docker restart remnanode || true
+        return 0
+      fi
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'remnawave-node'; then
+        docker restart remnawave-node || true
+        return 0
+      fi
+    fi
+    say "Службу ноды не нашёл. Сертификат уже на диске. Перезапусти ноду Remnawave сам."
+    return 0
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart xray || true
+  fi
 }
 
 test_xray_config() {
@@ -1050,8 +1197,12 @@ install_command() {
 apply_configs() {
   write_site
   write_nginx
-  write_xray
-  write_links
+  if [[ "$MODE" == remnawave ]]; then
+    write_remnawave_inbound
+  else
+    write_xray
+    write_links
+  fi
   save_state
 }
 
@@ -1138,7 +1289,10 @@ cmd_render() {
   if ! valid_port "$HTTP_PORT" || ! valid_port "$H2_PORT"; then
     die "порты"
   fi
-  ensure_users
+  normalize_mode
+  if [[ "$MODE" != remnawave ]]; then
+    ensure_users
+  fi
   make_self_signed
   apply_configs
   say "Собрано в $PREFIX"
@@ -1154,13 +1308,17 @@ cmd_install() {
     load_state
   fi
   prompt_missing
+  normalize_mode
   pick_ports
-  say "Домен $DOMAIN, шаблон $TEMPLATE, fallback 127.0.0.1:${HTTP_PORT} и :${H2_PORT}"
+  say "Домен $DOMAIN, шаблон $TEMPLATE, порт ${PUBLIC_PORT}, fallback 127.0.0.1:${HTTP_PORT} и :${H2_PORT}"
+  refuse_if_stream_proxy
   apt_install
   assert_ports_free
   check_dns
   install_command
-  install_xray_core
+  if [[ "$MODE" != remnawave ]]; then
+    install_xray_core
+  fi
   mkdir -p "$(acme_dir)" "$(site_dir)"
   chmod 755 /var/www/selftls "$(acme_dir)" || true
   # Port 80 has to answer before Let's Encrypt will issue the certificate.
@@ -1170,18 +1328,36 @@ cmd_install() {
   reload_nginx
   open_firewall
   issue_cert
-  ensure_users
+  if [[ "$MODE" != remnawave ]]; then
+    ensure_users
+  fi
   detect_h2
   choose_http2_style
   apply_configs
   enable_nginx_site
   reload_nginx
+  if [[ "$MODE" == remnawave ]]; then
+    reload_node
+    say
+    say "Готово. Xray Remnawave не трогал, вход и мост тоже."
+    say "Сертификат: $(cert_file)"
+    say "Ключ:       $(key_file)"
+    say "Сайт для fallback слушает только 127.0.0.1:${HTTP_PORT} и :${H2_PORT}."
+    say "Инбаунд для панели: $(inbound_file)"
+    say
+    cat "$(inbound_file)"
+    say
+    say "Клиентов впиши в панели. В этом json список пустой специально."
+    say "Если панель не принимает \"method\": \"raw\", замени его на \"network\": \"tcp\"."
+    say "Если нода в Docker и не видит эти пути, примонтируй $(cert_dir) в контейнер по тому же пути и перезапусти её."
+    return 0
+  fi
   test_xray_config
   systemctl enable xray
   systemctl restart xray
   say
   say "Готово. Браузер на https://${DOMAIN} показывает сайт. Клиент — ссылка ниже."
-  say "Xray слушает 0.0.0.0:443, nginx снаружи только :80."
+  say "Xray слушает 0.0.0.0:${PUBLIC_PORT}, nginx снаружи только :80."
   print_links
   if [[ -t 1 ]] && command -v qrencode >/dev/null 2>&1; then
     say
@@ -1194,6 +1370,11 @@ cmd_install() {
 
 cmd_link() {
   load_state
+  if [[ "$MODE" == remnawave ]]; then
+    say "Ссылку клиенту выдаёт Remnawave. Инбаунд:"
+    cat "$(inbound_file)"
+    return 0
+  fi
   [[ -f "$(links_file)" ]] || write_links
   print_links
   if [[ -t 2 ]] && command -v qrencode >/dev/null 2>&1; then
@@ -1205,18 +1386,26 @@ cmd_link() {
 cmd_status() {
   load_state
   say "selftls ${VERSION}"
+  say "режим:    $MODE"
   say "домен:    $DOMAIN"
   say "email:    $EMAIL"
   say "шаблон:   $TEMPLATE"
+  say "порт:     $PUBLIC_PORT"
   say "fallback: 127.0.0.1:${HTTP_PORT} (http/1.1), 127.0.0.1:${H2_PORT} (h2)"
-  [[ -f "$(users_file)" ]] || die "нет списка клиентов"
-  [[ -f "$(links_file)" ]] || write_links
-  say "клиенты:  $(jq 'length' "$(users_file)")"
+  if [[ "$MODE" == remnawave ]]; then
+    say "клиенты:  их ведёт панель Remnawave"
+  else
+    [[ -f "$(users_file)" ]] || die "нет списка клиентов"
+    [[ -f "$(links_file)" ]] || write_links
+    say "клиенты:  $(jq 'length' "$(users_file)")"
+  fi
   if [[ -z "$PREFIX" ]]; then
-    say "xray:     $(systemctl is-active xray 2>/dev/null || echo unknown)"
+    if [[ "$MODE" != remnawave ]]; then
+      say "xray:     $(systemctl is-active xray 2>/dev/null || echo unknown)"
+    fi
     say "nginx:    $(systemctl is-active nginx 2>/dev/null || echo unknown)"
   else
-    say "режим:    проверка каталога $PREFIX, службы не смотрел"
+    say "проверка: каталог $PREFIX, службы не смотрел"
   fi
   if [[ -s "$(cert_file)" ]]; then
     say "сертификат: $(openssl x509 -in "$(cert_file)" -noout -enddate 2>/dev/null | sed 's/notAfter=/до /')"
@@ -1225,12 +1414,20 @@ cmd_status() {
     say "сертификат: нет файла"
   fi
   say
-  print_links
+  if [[ "$MODE" == remnawave ]]; then
+    [[ -f "$(inbound_file)" ]] || write_remnawave_inbound
+    cat "$(inbound_file)"
+  else
+    print_links
+  fi
 }
 
 cmd_user() {
   local action name id tmp count
   load_state
+  if [[ "$MODE" == remnawave ]]; then
+    die "в режиме remnawave клиентов добавляет панель, не этот скрипт"
+  fi
   action=${1:-}
   name=${2:-${CLIENT_NAME:-}}
   case "$action" in
@@ -1327,7 +1524,7 @@ cmd_renew() {
     die "обновление сертификата не удалось (код $rc)"
   fi
   fix_cert_perms
-  systemctl restart xray
+  reload_node
   if [[ "$rc" -eq 2 ]]; then
     say "Срок ещё не подошёл, acme.sh оставил текущий сертификат. Для выпуска сейчас: selftls renew --force"
   else
@@ -1354,6 +1551,11 @@ read_state_loose() {
           DOMAIN=$val
         fi
         ;;
+      MODE)
+        if [[ "$val" == standalone || "$val" == remnawave ]]; then
+          MODE=$val
+        fi
+        ;;
       DISABLED_DEFAULT)
         if [[ "$val" == 0 || "$val" == 1 ]]; then
           DISABLED_DEFAULT=$val
@@ -1369,7 +1571,9 @@ cmd_uninstall() {
   [[ -z "$PREFIX" ]] || die "uninstall не принимает --prefix"
   DOMAIN=
   DISABLED_DEFAULT=0
+  MODE=
   read_state_loose "$(state_file)"
+  normalize_mode || true
   if [[ -n "${DOMAIN:-}" && -x /root/.acme.sh/acme.sh ]]; then
     acme=/root/.acme.sh/acme.sh
     "$acme" --remove -d "$DOMAIN" --ecc || true
@@ -1380,7 +1584,9 @@ cmd_uninstall() {
     ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
   fi
   rm -rf /var/www/selftls /usr/local/etc/selftls /usr/local/lib/selftls /usr/local/bin/selftls
-  if [[ "$PURGE" -eq 1 ]]; then
+  if [[ "$MODE" == remnawave ]]; then
+    say "Сайт и сертификат сняты. Ноду Remnawave и прокси на входе с мостом не трогал."
+  elif [[ "$PURGE" -eq 1 ]]; then
     local installer
     installer=$(mktemp)
     curl -fsSL -o "$installer" https://github.com/XTLS/Xray-install/raw/main/install-release.sh || true
@@ -1550,6 +1756,12 @@ parse_args() {
       --force) FORCE=1; shift ;;
       --purge) PURGE=1; shift ;;
       --no-h2) USE_H2=0; shift ;;
+      --remnawave) MODE=remnawave; shift ;;
+      --port)
+        [[ $# -ge 2 ]] || die "--port нуждается в значении"
+        PUBLIC_PORT=$2
+        shift 2
+        ;;
       --) shift; break ;;
       -*)
         die "неизвестный флаг: $1"
