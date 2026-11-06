@@ -5,7 +5,7 @@
 #
 # Debian and Ubuntu, systemd, root. See README.md.
 
-VERSION=1.2.4
+VERSION=1.2.5
 
 set -euo pipefail
 
@@ -1407,19 +1407,7 @@ cmd_install() {
   reload_nginx
   if [[ "$MODE" == remnawave ]]; then
     reload_node
-    say
-    say "Готово. Xray Remnawave не трогал, вход и мост тоже."
-    say "Сертификат: $(cert_file)"
-    say "Ключ:       $(key_file)"
-    say "Сайт для fallback слушает только 127.0.0.1:${HTTP_PORT} и :${H2_PORT}."
-    say "Инбаунд для панели: $(inbound_file)"
-    say
     cat "$(inbound_file)"
-    say
-    say "Клиентов панель дописывает сама. SNI берётся из serverName ($DOMAIN), flow уже xtls-rprx-vision."
-    say "В хосте поле SNI оставь пустым и выключи keep SNI blank. Иначе ссылка опять выйдет с пустым sni."
-    say "Нода файлы с диска не читает: сертификат забирает панель и сама отправляет его на ноду."
-    say "Монтировать надо контейнер панели, не ноды. В инбаунде укажи путь внутри контейнера панели."
     return 0
   fi
   test_xray_config
@@ -1441,7 +1429,7 @@ cmd_install() {
 cmd_link() {
   load_state
   if [[ "$MODE" == remnawave ]]; then
-    say "Ссылку клиенту выдаёт Remnawave. Инбаунд:"
+    [[ -f "$(inbound_file)" ]] || write_remnawave_inbound
     cat "$(inbound_file)"
     return 0
   fi
