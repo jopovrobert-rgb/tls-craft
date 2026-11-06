@@ -5,7 +5,7 @@
 #
 # Debian and Ubuntu, systemd, root. See README.md.
 
-VERSION=1.2.5
+VERSION=1.3.2
 
 set -euo pipefail
 
@@ -51,23 +51,17 @@ usage() {
   cat <<EOF
 selftls ${VERSION}
 
-VLESS TCP + TLS (xtls-rprx-vision) на 443 и обычный сайт для всех остальных.
-Сертификат Let's Encrypt на ваш домен. Reality здесь нет.
+VLESS TCP + TLS рядом с нодой Remnawave. Порт ноды скрипт спрашивает сам
+и не занимает его. Xray панели не перезаписывает. Reality здесь нет.
 
-  sudo bash selftls.sh install --domain example.com --email you@example.com
-  sudo bash selftls.sh install --domain example.com --email you@example.com --template press
+  sudo bash selftls.sh @ install --domain exit.example.com --email you@example.com
 
-Один файл, без папки share. На публичном raw-адресе:
+Порт можно передать и флагом, тогда вопрос не задаётся:
 
-  curl -fsSL https://raw.githubusercontent.com/USER/tls-craft/main/selftls.sh -o selftls.sh
-  sudo bash selftls.sh install --domain example.com --email you@example.com
+  sudo bash selftls.sh @ install --port 9443 --domain exit.example.com --email you@example.com
 
-Рядом с нодой Remnawave, не занимая её порт и не трогая вход с мостом:
-
-  sudo bash selftls.sh @ install --remnawave --port 4443 --domain exit.example.com --email you@example.com
-
-Скрипт выпускает сертификат и поднимает сайт на localhost. Инбаунд для панели лежит в
-/usr/local/etc/selftls/remnawave-inbound.json. Xray Remnawave скрипт не перезаписывает.
+Скрипт выпускает сертификат и поднимает сайт на localhost. В конце печатает
+готовый инбаунд для панели.
 
 Знак @ перед командой игнорируется, как в selfsteal:
 
@@ -88,10 +82,11 @@ VLESS TCP + TLS (xtls-rprx-vision) на 443 и обычный сайт для в
   sudo ./selftls.sh uninstall
   sudo ./selftls.sh uninstall --purge
 
-Флаги install: --domain --email --template --name --ip --force
+Флаги install: --domain --email --port --template --name --ip --force
 --ip ставит дополнительный адрес этой ВМ, если A-запись смотрит не на основной.
 --force пропускает сверку DNS.
-Нужны Debian или Ubuntu, свободные 80 и 443, и A-запись домена на этот VPS.
+--standalone ставит свой Xray на 443. По умолчанию этого нет: только Remnawave.
+Нужны Debian или Ubuntu, свободный порт 80 и A-запись домена на этот сервер.
 EOF
 }
 
@@ -604,7 +599,12 @@ write_site() {
 }
 
 has_ipv6() {
-  [[ -f /proc/net/if_inet6 ]]
+  local disabled
+  [[ -f /proc/net/if_inet6 ]] || return 1
+  # The file exists even when the provider turned IPv6 off. Binding [::]:80 then
+  # makes nginx fail at start after `nginx -t` already said the config is fine.
+  disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)
+  [[ "$disabled" == 0 ]]
 }
 
 choose_http2_style() {
@@ -787,7 +787,7 @@ write_xray() {
             certificates: [{certificateFile: $cert, keyFile: $key}]
           }
         },
-        sniffing: {enabled: true, destOverride: ["http", "tls", "quic"]}
+        sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
       }],
       outbounds: [
         {
@@ -857,7 +857,7 @@ write_remnawave_inbound() {
             certificates: [{certificateFile: $cert, keyFile: $key}]
           }
         },
-        sniffing: {enabled: true, destOverride: ["http", "tls", "quic"]}
+        sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
       }],
       outbounds: [
         {tag: "DIRECT", protocol: "freedom"},
@@ -1212,10 +1212,183 @@ enable_nginx_site() {
   fi
 }
 
+stop_unmanaged_nginx() {
+  local pid
+  systemctl is-active --quiet nginx && return 0
+  if [[ -s /run/nginx.pid ]]; then
+    pid=$(cat /run/nginx.pid)
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      nginx -s quit || kill "$pid" || true
+      sleep 1
+    fi
+  fi
+  # A master started outside systemd still holds port 80. The unit looks
+  # inactive, and the next start dies with "address already in use".
+  while read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$(cat "/proc/$pid/comm" 2>/dev/null || true)" == nginx ]] || continue
+    kill "$pid" || true
+  done < <(ss -H -ltnp 'sport = :80' 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u)
+  sleep 1
+}
+
+cert_mount() {
+  printf '%s\n' '/usr/local/etc/selftls/cert:/usr/local/etc/selftls/cert:ro'
+}
+
+find_compose_file() {
+  local name dir file
+  if command -v docker >/dev/null 2>&1; then
+    for name in remnanode remnawave-node; do
+      dir=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$name" 2>/dev/null || true)
+      file=${dir%%,*}
+      if [[ -n "$file" && -f "$file" ]]; then
+        printf '%s\n' "$file"
+        return 0
+      fi
+    done
+  fi
+  for file in /opt/remnanode/docker-compose.yml /opt/remnanode/docker-compose.yaml /opt/remnanode/compose.yml; do
+    if [[ -f "$file" ]]; then
+      printf '%s\n' "$file"
+      return 0
+    fi
+  done
+  return 1
+}
+
+insert_cert_volume() {
+  local file=$1 service=${2:-}
+  local mount line indent svc_indent vol_indent item_indent
+  local -a lines=()
+  local i n svc_at=-1 vol_at=-1 end in_services=0
+  [[ -f "$file" ]] || return 1
+  mount=$(cert_mount)
+  if grep -Fq "$mount" "$file"; then
+    return 0
+  fi
+  mapfile -t lines <"$file"
+  n=${#lines[@]}
+  if [[ -n "$service" ]]; then
+    for ((i = 0; i < n; i++)); do
+      line=${lines[$i]}
+      if [[ "$line" =~ ^([[:space:]]*)"$service":[[:space:]]*$ ]]; then
+        svc_at=$i
+        svc_indent=${#BASH_REMATCH[1]}
+        break
+      fi
+    done
+  fi
+  if [[ "$svc_at" -lt 0 ]]; then
+    for ((i = 0; i < n; i++)); do
+      line=${lines[$i]}
+      if [[ "$line" =~ ^[[:space:]]*services:[[:space:]]*$ ]]; then
+        in_services=1
+        continue
+      fi
+      if [[ "$in_services" -eq 1 && "$line" =~ ^([[:space:]]+)([A-Za-z0-9_-]+):[[:space:]]*$ ]]; then
+        svc_at=$i
+        svc_indent=${#BASH_REMATCH[1]}
+        break
+      fi
+    done
+  fi
+  [[ "$svc_at" -ge 0 ]] || return 1
+  end=$n
+  for ((i = svc_at + 1; i < n; i++)); do
+    line=${lines[$i]}
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^([[:space:]]*) ]] || continue
+    indent=${#BASH_REMATCH[1]}
+    if (( indent <= svc_indent )); then
+      end=$i
+      break
+    fi
+    if [[ "$line" =~ ^([[:space:]]*)volumes:[[:space:]]*$ ]]; then
+      vol_at=$i
+      vol_indent=${#BASH_REMATCH[1]}
+    fi
+  done
+  item_indent=$((svc_indent + 4))
+  if [[ "$vol_at" -ge 0 ]]; then
+    item_indent=$((vol_indent + 2))
+    for ((i = vol_at + 1; i < end; i++)); do
+      line=${lines[$i]}
+      if [[ "$line" =~ ^([[:space:]]*)-[[:space:]] ]]; then
+        item_indent=${#BASH_REMATCH[1]}
+        break
+      fi
+    done
+  fi
+  local tmp
+  tmp=$(mktemp)
+  for ((i = 0; i < n; i++)); do
+    if [[ "$vol_at" -lt 0 && "$i" -eq "$end" ]]; then
+      printf '%*svolumes:\n' $((svc_indent + 2)) '' >>"$tmp"
+      printf '%*s- %s\n' "$item_indent" '' "$mount" >>"$tmp"
+    fi
+    printf '%s\n' "${lines[$i]}" >>"$tmp"
+    if [[ "$vol_at" -ge 0 && "$i" -eq "$vol_at" ]]; then
+      printf '%*s- %s\n' "$item_indent" '' "$mount" >>"$tmp"
+    fi
+  done
+  if [[ "$vol_at" -lt 0 && "$end" -eq "$n" ]]; then
+    printf '%*svolumes:\n' $((svc_indent + 2)) '' >>"$tmp"
+    printf '%*s- %s\n' "$item_indent" '' "$mount" >>"$tmp"
+  fi
+  cat "$tmp" >"$file"
+  rm -f "$tmp"
+}
+
+recreate_compose() {
+  local file=$1 dir
+  dir=$(dirname "$file")
+  if docker compose version >/dev/null 2>&1; then
+    docker compose -f "$file" --project-directory "$dir" up -d
+    return
+  fi
+  if command -v docker-compose >/dev/null 2>&1; then
+    docker-compose -f "$file" up -d
+    return
+  fi
+  return 1
+}
+
+mount_cert_in_compose() {
+  local file service
+  file=$(find_compose_file) || {
+    say "docker-compose.yml ноды не нашёл. Том сам не добавил." >&2
+    return 0
+  }
+  service=
+  if command -v docker >/dev/null 2>&1; then
+    service=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' remnanode 2>/dev/null || true)
+    [[ -n "$service" ]] || service=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' remnawave-node 2>/dev/null || true)
+  fi
+  if grep -Fq "$(cert_mount)" "$file"; then
+    return 0
+  fi
+  insert_cert_volume "$file" "$service" || {
+    say "Не смог дописать том в $file." >&2
+    return 0
+  }
+  say "Том сертификата добавлен в $file" >&2
+  recreate_compose "$file" || say "Контейнер сам не пересоздал. В каталоге файла: docker compose up -d" >&2
+}
+
 reload_nginx() {
   nginx -t
   systemctl enable nginx
-  systemctl reload nginx || systemctl restart nginx
+  if systemctl reload nginx 2>/dev/null; then
+    return 0
+  fi
+  stop_unmanaged_nginx
+  if systemctl restart nginx; then
+    return 0
+  fi
+  journalctl -u nginx -n 40 --no-pager >&2 || true
+  die "nginx не запустился"
 }
 
 open_firewall() {
@@ -1318,10 +1491,27 @@ prompt_missing() {
     fi
   fi
   valid_template "$TEMPLATE" || die "шаблон: ledger, press или kiln"
+  if [[ "$MODE" == remnawave && -z "$PUBLIC_PORT" ]]; then
+    if [[ -t 0 ]]; then
+      PROMPTED=1
+      read -r -p "Порт ноды Remnawave: " PUBLIC_PORT
+    else
+      die "укажите --port, на котором уже слушает нода"
+    fi
+  fi
+  if [[ "$MODE" == remnawave ]]; then
+    if [[ "$PUBLIC_PORT" == 80 ]]; then
+      die "порт 80 занят выпуском сертификата"
+    fi
+    valid_public_port "$PUBLIC_PORT" || die "порт ноды кривой: ${PUBLIC_PORT:-пусто}"
+  fi
   if [[ "$PROMPTED" -eq 1 && -t 0 ]]; then
     say "Домен:   $DOMAIN"
     say "Email:   $EMAIL"
     say "Шаблон:  $TEMPLATE"
+    if [[ "$MODE" == remnawave ]]; then
+      say "Порт:    $PUBLIC_PORT"
+    fi
     read -r -p "Ставить? [y/N] " answer
     case "$answer" in
       y|Y|yes|Yes) ;;
@@ -1376,6 +1566,9 @@ cmd_install() {
   if [[ -f "$(state_file)" ]]; then
     load_state
   fi
+  if [[ -z "$MODE" ]]; then
+    MODE=remnawave
+  fi
   prompt_missing
   normalize_mode
   pick_ports
@@ -1407,6 +1600,7 @@ cmd_install() {
   reload_nginx
   if [[ "$MODE" == remnawave ]]; then
     reload_node
+    mount_cert_in_compose
     cat "$(inbound_file)"
     return 0
   fi
@@ -1815,6 +2009,7 @@ parse_args() {
       --purge) PURGE=1; shift ;;
       --no-h2) USE_H2=0; shift ;;
       --remnawave) MODE=remnawave; shift ;;
+      --standalone) MODE=standalone; shift ;;
       --port)
         [[ $# -ge 2 ]] || die "--port нуждается в значении"
         PUBLIC_PORT=$2
@@ -1842,6 +2037,10 @@ parse_args() {
 }
 
 main() {
+  if [[ -n "${SELFTLS_TEST_COMPOSE:-}" ]]; then
+    insert_cert_volume "$SELFTLS_TEST_COMPOSE" "${SELFTLS_TEST_SERVICE:-}"
+    return 0
+  fi
   parse_args "$@"
   case "${COMMAND:-}" in
     ""|menu)
