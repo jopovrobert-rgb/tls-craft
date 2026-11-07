@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # selftls — VLESS over TCP with a real TLS certificate and a fallback site.
-# Port 443 belongs to Xray. A browser that is not a client is handed to nginx.
+# The inbound port belongs to Xray. A browser that is not a client is handed to nginx.
+# When that port is not 443, nginx can also serve the same site on 443.
 # Reality is not configured. WebSocket, gRPC, and XHTTP are not configured.
 #
 # Debian and Ubuntu, systemd, root. See README.md.
 
-VERSION=1.3.4
+VERSION=1.3.7
 
 set -euo pipefail
 
@@ -46,6 +47,8 @@ PORT_FROM_FLAG=0
 STANDALONE=0
 PANEL_IP=
 NODE_API_PORT=
+SITE_443=
+SITE_443_EXPLICIT=0
 PROMPTED=0
 DISABLED_DEFAULT=0
 HTTP_PORT=
@@ -91,6 +94,8 @@ VLESS TCP + TLS рядом с нодой Remnawave. Порт ноды скрип
 --force пропускает сверку DNS.
 --standalone ставит свой Xray на 443. По умолчанию этого нет: только Remnawave.
 Заглушка на порту инбаунда: TCP TLS и flow xtls-rprx-vision, с 80 идёт 301.
+Если инбаунд не на 443, скрипт спрашивает, поднять ли тот же сайт на 443.
+--site-443 включает его без вопроса, --no-site-443 не ставит.
 --panel-ip ограничивает порт API Remnanode этим адресом, остальным отвечает RST.
 --node-port задаёт этот порт, если скрипт сам не увидел NODE_PORT.
 Нужны Debian или Ubuntu, свободный порт 80 и A-запись домена на этот сервер.
@@ -462,6 +467,10 @@ load_state() {
         valid_port "$val" || die "битый NODE_API_PORT в $file"
         [[ -z "$NODE_API_PORT" ]] && NODE_API_PORT=$val
         ;;
+      SITE_443)
+        [[ "$val" == 0 || "$val" == 1 ]] || die "битый SITE_443 в $file"
+        [[ -z "$SITE_443" ]] && SITE_443=$val
+        ;;
       *)
         die "неизвестное поле $key в $file"
         ;;
@@ -488,6 +497,16 @@ normalize_mode() {
   if [[ -n "$H2_PORT" && "$PUBLIC_PORT" == "$H2_PORT" ]]; then
     die "порт ноды $PUBLIC_PORT совпал с локальным h2"
   fi
+  if [[ "$PUBLIC_PORT" == 443 ]]; then
+    if [[ "$SITE_443" == 1 && "$SITE_443_EXPLICIT" -eq 1 ]]; then
+      say "Инбаунд на 443, nginx отдельно на 443 не ставится: заглушка уже на этом порту." >&2
+    fi
+    SITE_443=0
+  elif [[ "$MODE" != remnawave && "$SITE_443" == 1 ]]; then
+    die "отдельный сайт на 443 только рядом с Remnawave, когда нода слушает другой порт"
+  elif [[ -n "$SITE_443" && "$SITE_443" != 0 && "$SITE_443" != 1 ]]; then
+    die "сайт на 443: 0 или 1"
+  fi
 }
 
 save_state() {
@@ -509,6 +528,7 @@ PUBLIC_PORT=${PUBLIC_PORT}
 PUBLIC_IP=${PUBLIC_IP}
 PANEL_IP=${PANEL_IP}
 NODE_API_PORT=${NODE_API_PORT}
+SITE_443=${SITE_443:-0}
 EOF
   chmod 600 "$file"
 }
@@ -661,6 +681,7 @@ detect_h2() {
 
 nginx_site_locations() {
   local root_dir=$1
+  local proxy=${2:-1}
   cat <<EOF
     root ${root_dir};
     index index.html;
@@ -670,9 +691,15 @@ nginx_site_locations() {
     add_header X-Content-Type-Options nosniff always;
     add_header Referrer-Policy strict-origin-when-cross-origin always;
     add_header Strict-Transport-Security "max-age=15552000" always;
+EOF
+  if [[ "$proxy" -eq 1 ]]; then
+    cat <<EOF
 
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
+EOF
+  fi
+  cat <<EOF
 
     location ~ /\\. {
         deny all;
@@ -689,6 +716,40 @@ nginx_site_locations() {
 EOF
 }
 
+write_public_443() {
+  local root_dir=$1 access=$2
+  local listen4 listen6
+  [[ "$SITE_443" == 1 ]] || return 0
+  [[ "$PUBLIC_PORT" != 443 ]] || return 0
+  [[ -s "$(cert_file)" && -s "$(key_file)" ]] || return 0
+  listen4="listen 443 ssl default_server;"
+  listen6="listen [::]:443 ssl default_server;"
+  if [[ "$USE_H2" -eq 1 && "$HTTP2_STYLE" == classic ]]; then
+    listen4="listen 443 ssl http2 default_server;"
+    listen6="listen [::]:443 ssl http2 default_server;"
+  fi
+  cat <<EOF
+
+server {
+    ${listen4}
+EOF
+  if has_ipv6; then
+    printf '    %s\n' "$listen6"
+  fi
+  cat <<EOF
+    server_name ${DOMAIN};
+    ssl_certificate $(cert_file);
+    ssl_certificate_key $(key_file);
+    ssl_protocols TLSv1.2 TLSv1.3;
+    access_log ${access} selftls;
+EOF
+  if [[ "$USE_H2" -eq 1 && "$HTTP2_STYLE" == modern ]]; then
+    printf '    http2 on;\n'
+  fi
+  nginx_site_locations "$root_dir" 0
+  printf '}\n'
+}
+
 write_nginx() {
   local file root_dir acme access h2_listen https_redir
   file=$(nginx_site)
@@ -699,7 +760,7 @@ write_nginx() {
   choose_http2_style
   detect_h2
   normalize_mode
-  if [[ "$PUBLIC_PORT" == 443 ]]; then
+  if [[ "$PUBLIC_PORT" == 443 || "$SITE_443" == 1 ]]; then
     # shellcheck disable=SC2016
     https_redir="return 301 https://${DOMAIN}"'$request_uri;'
   else
@@ -757,6 +818,7 @@ EOF
       nginx_site_locations "$root_dir"
       printf '}\n'
     fi
+    write_public_443 "$root_dir" "$access"
   } >"$file"
 }
 
@@ -1102,6 +1164,12 @@ assert_ports_free() {
   if systemctl is-active --quiet apache2 2>/dev/null || systemctl is-active --quiet httpd 2>/dev/null; then
     die "Apache уже слушает веб. Остановите его сами: selftls его не трогает."
   fi
+  if [[ "$SITE_443" == 1 ]]; then
+    row=$(listeners 443)
+    if [[ -n "$row" ]] && ! grep -q 'nginx' <<<"$row"; then
+      die "порт 443 занят, сайт туда не ставлю: $row. Освободи его или повтори с --no-site-443"
+    fi
+  fi
 }
 
 apt_install() {
@@ -1235,23 +1303,37 @@ enable_nginx_site() {
   fi
 }
 
+explain_port80() {
+  local line names
+  line=$(ss -H -ltnp 'sport = :80' 2>/dev/null || true)
+  if [[ -n "$line" ]]; then
+    say "Порт 80 занят:" >&2
+    printf '%s\n' "$line" >&2
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    names=$(docker ps --filter publish=80 --format '{{.Names}} {{.Ports}}' 2>/dev/null || true)
+    if [[ -n "$names" ]]; then
+      say "Порт 80 публикует контейнер: ${names}" >&2
+    fi
+  fi
+}
+
 stop_unmanaged_nginx() {
   local pid
   systemctl is-active --quiet nginx && return 0
   if [[ -s /run/nginx.pid ]]; then
     pid=$(cat /run/nginx.pid)
     if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-      nginx -s quit || kill "$pid" || true
-      sleep 1
+      kill -9 "$pid" 2>/dev/null || true
     fi
   fi
-  # A master started outside systemd still holds port 80. The unit looks
-  # inactive, and the next start dies with "address already in use".
+  # ss lists every worker on one line. A pattern that keeps only the last pid
+  # leaves the master alive, and the listen socket stays on port 80.
   while read -r pid; do
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     [[ "$(cat "/proc/$pid/comm" 2>/dev/null || true)" == nginx ]] || continue
-    kill "$pid" || true
-  done < <(ss -H -ltnp 'sport = :80' 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u)
+    kill -9 "$pid" 2>/dev/null || true
+  done < <(ss -H -ltnp 'sport = :80' 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u)
   sleep 1
 }
 
@@ -1402,6 +1484,7 @@ mount_cert_in_compose() {
 
 reload_nginx() {
   nginx -t
+  stop_unmanaged_nginx
   systemctl enable nginx
   if systemctl reload nginx 2>/dev/null; then
     return 0
@@ -1410,8 +1493,8 @@ reload_nginx() {
   if systemctl restart nginx; then
     return 0
   fi
-  journalctl -u nginx -n 40 --no-pager >&2 || true
-  die "nginx не запустился"
+  explain_port80
+  die "nginx не запустился: порт 80 занят. Если это nginx без systemd, останови его. Если это контейнер, сними с него публикацию 80."
 }
 
 detect_node_api_port() {
@@ -1455,6 +1538,29 @@ prompt_panel_lock() {
   valid_port "$NODE_API_PORT" || die "порт Remnanode кривой: $NODE_API_PORT"
   if [[ "$NODE_API_PORT" == 80 || "$NODE_API_PORT" == "$PUBLIC_PORT" ]]; then
     die "порт Remnanode не должен быть 80 или портом инбаунда"
+  fi
+}
+
+prompt_site_443() {
+  local answer
+  if [[ "$MODE" != remnawave || "$PUBLIC_PORT" == 443 ]]; then
+    return 0
+  fi
+  if [[ -z "$SITE_443" ]]; then
+    if [[ -t 0 ]]; then
+      PROMPTED=1
+      read -r -p "На 443 ноды нет. Поднять там тот же сайт? [Y/n] " answer
+      case "$answer" in
+        n|N|no|No) SITE_443=0 ;;
+        *) SITE_443=1 ;;
+      esac
+    else
+      SITE_443=0
+    fi
+  fi
+  [[ "$SITE_443" == 0 || "$SITE_443" == 1 ]] || die "сайт на 443: 0 или 1"
+  if [[ "$SITE_443" == 1 && "$NODE_API_PORT" == 443 ]]; then
+    die "порт Remnanode 443, на него сайт не поставить"
   fi
 }
 
@@ -1612,6 +1718,7 @@ prompt_missing() {
     valid_public_port "$PUBLIC_PORT" || die "порт ноды кривой: ${PUBLIC_PORT:-пусто}"
   fi
   prompt_panel_lock
+  prompt_site_443
   if [[ "$PROMPTED" -eq 1 && -t 0 ]]; then
     say "Домен:   $DOMAIN"
     say "Email:   $EMAIL"
@@ -1620,6 +1727,13 @@ prompt_missing() {
       say "Порт:    $PUBLIC_PORT"
       if [[ -n "$PANEL_IP" ]]; then
         say "Панель:  $PANEL_IP, порт API $NODE_API_PORT"
+      fi
+      if [[ "$PUBLIC_PORT" != 443 ]]; then
+        if [[ "$SITE_443" == 1 ]]; then
+          say "Сайт:    ещё и на 443"
+        else
+          say "Сайт:    только на порту инбаунда"
+        fi
       fi
     fi
     read -r -p "Ставить? [y/N] " answer
@@ -1683,6 +1797,9 @@ cmd_install() {
   normalize_mode
   pick_ports
   say "Домен $DOMAIN, шаблон $TEMPLATE, порт ${PUBLIC_PORT}, fallback 127.0.0.1:${HTTP_PORT} и :${H2_PORT}"
+  if [[ "$SITE_443" == 1 ]]; then
+    say "Сайт на 443 поднимется после выпуска сертификата. Инбаунд остаётся на ${PUBLIC_PORT}."
+  fi
   refuse_if_stream_proxy
   apt_install
   assert_ports_free
@@ -1712,6 +1829,9 @@ cmd_install() {
     reload_node
     mount_cert_in_compose
     lock_node_api
+    if [[ "$SITE_443" == 1 ]]; then
+      say "Сайт открывается на https://${DOMAIN}. VLESS на 443 не слушает, инбаунд на ${PUBLIC_PORT}."
+    fi
     cat "$(inbound_file)"
     exit 0
   fi
@@ -1754,6 +1874,13 @@ cmd_status() {
   say "email:    $EMAIL"
   say "шаблон:   $TEMPLATE"
   say "порт:     $PUBLIC_PORT"
+  if [[ "$PUBLIC_PORT" == 443 ]]; then
+    say "сайт 443: на порту инбаунда"
+  elif [[ "$SITE_443" == 1 ]]; then
+    say "сайт 443: nginx, тот же шаблон"
+  else
+    say "сайт 443: нет"
+  fi
   say "fallback: 127.0.0.1:${HTTP_PORT} (http/1.1), 127.0.0.1:${H2_PORT} (h2)"
   if [[ "$MODE" == remnawave ]]; then
     say "клиенты:  их ведёт панель Remnawave"
@@ -2141,6 +2268,18 @@ parse_args() {
         [[ $# -ge 2 ]] || die "--ip нуждается в значении"
         PUBLIC_IP=$2
         shift 2
+        ;;
+      --site-443)
+        [[ "$SITE_443" != 0 ]] || die "нельзя одновременно --site-443 и --no-site-443"
+        SITE_443=1
+        SITE_443_EXPLICIT=1
+        shift
+        ;;
+      --no-site-443)
+        [[ "$SITE_443" != 1 ]] || die "нельзя одновременно --site-443 и --no-site-443"
+        SITE_443=0
+        SITE_443_EXPLICIT=1
+        shift
         ;;
       --) shift; break ;;
       -*)
