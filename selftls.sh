@@ -5,7 +5,7 @@
 #
 # Debian and Ubuntu, systemd, root. See README.md.
 
-VERSION=1.3.3
+VERSION=1.3.4
 
 set -euo pipefail
 
@@ -44,6 +44,8 @@ PUBLIC_PORT=
 PUBLIC_IP=
 PORT_FROM_FLAG=0
 STANDALONE=0
+PANEL_IP=
+NODE_API_PORT=
 PROMPTED=0
 DISABLED_DEFAULT=0
 HTTP_PORT=
@@ -88,6 +90,9 @@ VLESS TCP + TLS рядом с нодой Remnawave. Порт ноды скрип
 --ip ставит дополнительный адрес этой ВМ, если A-запись смотрит не на основной.
 --force пропускает сверку DNS.
 --standalone ставит свой Xray на 443. По умолчанию этого нет: только Remnawave.
+Заглушка на порту инбаунда: TCP TLS и flow xtls-rprx-vision, с 80 идёт 301.
+--panel-ip ограничивает порт API Remnanode этим адресом, остальным отвечает RST.
+--node-port задаёт этот порт, если скрипт сам не увидел NODE_PORT.
 Нужны Debian или Ubuntu, свободный порт 80 и A-запись домена на этот сервер.
 EOF
 }
@@ -447,6 +452,16 @@ load_state() {
         valid_ipv4 "$val" || die "битый PUBLIC_IP в $file"
         [[ -z "$PUBLIC_IP" ]] && PUBLIC_IP=$val
         ;;
+      PANEL_IP)
+        [[ -z "$val" ]] && continue
+        valid_ipv4 "$val" || die "битый PANEL_IP в $file"
+        [[ -z "$PANEL_IP" ]] && PANEL_IP=$val
+        ;;
+      NODE_API_PORT)
+        [[ -z "$val" ]] && continue
+        valid_port "$val" || die "битый NODE_API_PORT в $file"
+        [[ -z "$NODE_API_PORT" ]] && NODE_API_PORT=$val
+        ;;
       *)
         die "неизвестное поле $key в $file"
         ;;
@@ -492,6 +507,8 @@ DISABLED_DEFAULT=${DISABLED_DEFAULT}
 MODE=${MODE}
 PUBLIC_PORT=${PUBLIC_PORT}
 PUBLIC_IP=${PUBLIC_IP}
+PANEL_IP=${PANEL_IP}
+NODE_API_PORT=${NODE_API_PORT}
 EOF
   chmod 600 "$file"
 }
@@ -786,6 +803,8 @@ write_xray() {
           security: "tls",
           tlsSettings: {
             alpn: $alpn,
+            minVersion: "1.2",
+            maxVersion: "1.3",
             certificates: [{certificateFile: $cert, keyFile: $key}]
           }
         },
@@ -856,6 +875,8 @@ write_remnawave_inbound() {
           tlsSettings: {
             serverName: $serverName,
             alpn: $alpn,
+            minVersion: "1.2",
+            maxVersion: "1.3",
             certificates: [{certificateFile: $cert, keyFile: $key}]
           }
         },
@@ -1393,6 +1414,84 @@ reload_nginx() {
   die "nginx не запустился"
 }
 
+detect_node_api_port() {
+  local name env port file
+  if command -v docker >/dev/null 2>&1; then
+    for name in remnanode remnawave-node; do
+      env=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$name" 2>/dev/null || true)
+      port=$(printf '%s\n' "$env" | sed -n 's/^NODE_PORT=//p' | head -n 1)
+      if valid_port "$port"; then
+        printf '%s\n' "$port"
+        return 0
+      fi
+    done
+  fi
+  for file in /opt/remnanode/.env /opt/remnawave/.env; do
+    [[ -f "$file" ]] || continue
+    port=$(sed -n 's/^NODE_PORT=//p' "$file" | head -n 1)
+    if valid_port "$port"; then
+      printf '%s\n' "$port"
+      return 0
+    fi
+  done
+  return 1
+}
+
+prompt_panel_lock() {
+  [[ "$MODE" == remnawave ]] || return 0
+  if [[ -z "$PANEL_IP" && -t 0 ]]; then
+    PROMPTED=1
+    read -r -p "IP панели, чтобы закрыть порт Remnanode [пропустить]: " PANEL_IP
+  fi
+  [[ -n "$PANEL_IP" ]] || return 0
+  valid_ipv4 "$PANEL_IP" || die "IP панели кривой: $PANEL_IP"
+  if [[ -z "$NODE_API_PORT" ]]; then
+    NODE_API_PORT=$(detect_node_api_port || true)
+  fi
+  if [[ -z "$NODE_API_PORT" && -t 0 ]]; then
+    read -r -p "Порт Remnanode, NODE_PORT: " NODE_API_PORT
+  fi
+  [[ -n "$NODE_API_PORT" ]] || die "укажите --node-port, порт API Remnanode"
+  valid_port "$NODE_API_PORT" || die "порт Remnanode кривой: $NODE_API_PORT"
+  if [[ "$NODE_API_PORT" == 80 || "$NODE_API_PORT" == "$PUBLIC_PORT" ]]; then
+    die "порт Remnanode не должен быть 80 или портом инбаунда"
+  fi
+}
+
+lock_node_api() {
+  [[ "$MODE" == remnawave ]] || return 0
+  [[ -n "$PANEL_IP" && -n "$NODE_API_PORT" ]] || return 0
+  [[ -z "$PREFIX" ]] || return 0
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow from "$PANEL_IP" to any port "$NODE_API_PORT" proto tcp
+    ufw deny "$NODE_API_PORT"/tcp
+    say "Порт Remnanode ${NODE_API_PORT}: с ${PANEL_IP} пускает, остальным отказ." >&2
+    return 0
+  fi
+  command -v iptables >/dev/null 2>&1 || {
+    say "iptables нет, порт Remnanode сам не закрыл." >&2
+    return 0
+  }
+  iptables -C INPUT -p tcp --dport "$NODE_API_PORT" -s "$PANEL_IP" -j ACCEPT 2>/dev/null \
+    || iptables -I INPUT -p tcp --dport "$NODE_API_PORT" -s "$PANEL_IP" -j ACCEPT
+  iptables -C INPUT -p tcp --dport "$NODE_API_PORT" -j REJECT --reject-with tcp-reset 2>/dev/null \
+    || iptables -A INPUT -p tcp --dport "$NODE_API_PORT" -j REJECT --reject-with tcp-reset
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -C INPUT -p tcp --dport "$NODE_API_PORT" -j REJECT --reject-with tcp-reset 2>/dev/null \
+      || ip6tables -A INPUT -p tcp --dport "$NODE_API_PORT" -j REJECT --reject-with tcp-reset
+  fi
+  if iptables -S DOCKER-USER >/dev/null 2>&1; then
+    iptables -C DOCKER-USER -p tcp --dport "$NODE_API_PORT" -s "$PANEL_IP" -j RETURN 2>/dev/null \
+      || iptables -I DOCKER-USER -p tcp --dport "$NODE_API_PORT" -s "$PANEL_IP" -j RETURN
+    iptables -C DOCKER-USER -p tcp --dport "$NODE_API_PORT" -j REJECT --reject-with tcp-reset 2>/dev/null \
+      || iptables -A DOCKER-USER -p tcp --dport "$NODE_API_PORT" -j REJECT --reject-with tcp-reset
+  fi
+  mkdir -p /etc/iptables
+  iptables-save > /etc/iptables/rules.v4 || true
+  ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+  say "Порт Remnanode ${NODE_API_PORT}: с ${PANEL_IP} пускает, остальным RST." >&2
+}
+
 open_firewall() {
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
     ufw allow 80/tcp
@@ -1500,7 +1599,7 @@ prompt_missing() {
         read -r -p "Порт ноды Remnawave [$PUBLIC_PORT]: " answer
         [[ -n "$answer" ]] && PUBLIC_PORT=$answer
       else
-        read -r -p "Порт ноды Remnawave: " PUBLIC_PORT
+        read -r -p "Порт инбаунда, для заглушки это 443: " PUBLIC_PORT
       fi
     elif [[ -z "$PUBLIC_PORT" ]]; then
       die "укажите --port, на котором уже слушает нода"
@@ -1512,12 +1611,16 @@ prompt_missing() {
     fi
     valid_public_port "$PUBLIC_PORT" || die "порт ноды кривой: ${PUBLIC_PORT:-пусто}"
   fi
+  prompt_panel_lock
   if [[ "$PROMPTED" -eq 1 && -t 0 ]]; then
     say "Домен:   $DOMAIN"
     say "Email:   $EMAIL"
     say "Шаблон:  $TEMPLATE"
     if [[ "$MODE" == remnawave ]]; then
       say "Порт:    $PUBLIC_PORT"
+      if [[ -n "$PANEL_IP" ]]; then
+        say "Панель:  $PANEL_IP, порт API $NODE_API_PORT"
+      fi
     fi
     read -r -p "Ставить? [y/N] " answer
     case "$answer" in
@@ -1608,6 +1711,7 @@ cmd_install() {
   if [[ "$MODE" == remnawave ]]; then
     reload_node
     mount_cert_in_compose
+    lock_node_api
     cat "$(inbound_file)"
     exit 0
   fi
@@ -2021,6 +2125,16 @@ parse_args() {
         [[ $# -ge 2 ]] || die "--port нуждается в значении"
         PUBLIC_PORT=$2
         PORT_FROM_FLAG=1
+        shift 2
+        ;;
+      --panel-ip)
+        [[ $# -ge 2 ]] || die "--panel-ip нуждается в значении"
+        PANEL_IP=$2
+        shift 2
+        ;;
+      --node-port)
+        [[ $# -ge 2 ]] || die "--node-port нуждается в значении"
+        NODE_API_PORT=$2
         shift 2
         ;;
       --ip)
