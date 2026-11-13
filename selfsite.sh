@@ -1,5 +1,3 @@
-#!/usr/bin/env bash
-# Renders the site-only nginx config and checks that Xray is left alone.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SCRIPT=$ROOT/selfsite.sh
